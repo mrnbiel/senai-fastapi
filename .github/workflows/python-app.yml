@@ -1,0 +1,83 @@
+name: LAB9 CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: gabrielmrn/senai_fastapi
+
+jobs:
+  test:
+    name: Compilar Projeto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m compileall -q app
+      - run: python -m pytest
+
+  image:
+    name: Imagem Docker
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name == 'develop' && 'develop' || 'main' }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy ${{ github.ref_name == 'main' && 'Produção' || 'Homologação' }}
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    needs: image
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Implantar por SSH e validar saúde
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+          HOST: ${{ secrets.EC2_HOST }}
+          USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          DEPLOY_PORT: ${{ github.ref_name == 'main' && '80' || '8080' }}
+        run: |
+          set -euo pipefail
+          : "${HOST:?}" "${USERNAME:?}" "${SSH_KEY:?}" "${KNOWN_HOSTS:?}"
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          umask 077
+          key="$RUNNER_TEMP/lab9-key"
+          known_hosts="$RUNNER_TEMP/lab9-known-hosts"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$known_hosts"
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+            -- "$USERNAME@$HOST" bash -s -- "$IMAGE_NAME@$DIGEST" "$DEPLOY_PORT" \
+            < scripts/deploy.sh
